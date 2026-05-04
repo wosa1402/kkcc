@@ -9,12 +9,12 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version label for artifacts (e.g., 2025.12.1)'
+        description: 'Release version, with or without v prefix (e.g., v2026.3.1)'
         required: true
-        default: '2026.1.1'
+        default: 'v2026.3.1'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   pre-check:
@@ -26,14 +26,16 @@ jobs:
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
         with:
           fetch-depth: 0
+
       - name: Check if commit has release tag
         id: check
+        shell: bash
         run: |
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/heads/* ]] && git tag --points-at HEAD | grep -q '^v'; then
-            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
             echo "::notice::Skipping beta build: commit already has a release tag"
           else
-            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
   build:
@@ -76,18 +78,24 @@ jobs:
         shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            VERSION="${{ github.event.inputs.version }}"
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            VERSION="${{ github.ref_name }}"
           else
-            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-6)
-            echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
+            SHORT_SHA="$(echo "${{ github.sha }}" | cut -c1-6)"
+            VERSION="beta-${SHORT_SHA}"
           fi
+
+          if [[ "$VERSION" != beta-* && "$VERSION" != v* ]]; then
+            VERSION="v${VERSION}"
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -110,17 +118,56 @@ jobs:
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "rust-cache-${{ matrix.target }}"
+          shared-key: rust-cache-${{ matrix.target }}
           cache-on-failure: true
 
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
       - name: Build app
-        run: cargo build --release --target ${{ matrix.target }} ${{ contains(matrix.target, 'musl') && '--no-default-features' || '' }}
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features
+
+      - name: Package release asset
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          NAME="${{ matrix.name }}"
+          TARGET="${{ matrix.target }}"
+          ASSET="kiro-rs-${VERSION}-${NAME}.tar.gz"
+          PACKAGE_DIR="release-assets/kiro-rs-${VERSION}-${NAME}"
+
+          mkdir -p "$PACKAGE_DIR"
+          cp "target/${TARGET}/release/kiro-rs" "$PACKAGE_DIR/kiro-rs"
+          chmod +x "$PACKAGE_DIR/kiro-rs"
+          cp README.md config.example.json "$PACKAGE_DIR/"
+          cp credentials.example.*.json "$PACKAGE_DIR/"
+
+          tar -czf "release-assets/${ASSET}" -C release-assets "kiro-rs-${VERSION}-${NAME}"
+          rm -rf "$PACKAGE_DIR"
+
+      - name: Package release asset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Version = "${{ steps.version.outputs.version }}"
+          $Name = "${{ matrix.name }}"
+          $Target = "${{ matrix.target }}"
+          $Asset = "kiro-rs-$Version-$Name.zip"
+          $PackageDir = "release-assets/kiro-rs-$Version-$Name"
+
+          New-Item -ItemType Directory -Force $PackageDir | Out-Null
+          Copy-Item "target/$Target/release/kiro-rs.exe" "$PackageDir/kiro-rs.exe"
+          Copy-Item "README.md" $PackageDir
+          Copy-Item "config.example.json" $PackageDir
+          Get-ChildItem -Path . -Filter "credentials.example.*.json" | Copy-Item -Destination $PackageDir
+
+          Compress-Archive -Path "$PackageDir/*" -DestinationPath "release-assets/$Asset" -Force
+          Remove-Item -Recurse -Force $PackageDir
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -128,6 +175,58 @@ jobs:
           name: kiro-rs-${{ steps.version.outputs.version }}-${{ matrix.name }}
           if-no-files-found: error
           compression-level: 6
-          path: |
-            target/${{ matrix.target }}/release/kiro-rs
-            target/${{ matrix.target }}/release/kiro-rs.exe
+          path: release-assets/*
+
+  release:
+    needs:
+      - pre-check
+      - build
+    if: needs.pre-check.outputs.should_build == 'true' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${{ github.ref_name }}"
+          fi
+
+          if [[ "$VERSION" != v* ]]; then
+            VERSION="v${VERSION}"
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: kiro-rs-${{ steps.version.outputs.version }}-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" release-assets/* --clobber
+          else
+            gh release create "$VERSION" release-assets/* \
+              --title "kiro-rs ${VERSION}" \
+              --notes "Automated release for ${VERSION}." \
+              --target "${{ github.sha }}"
+          fi

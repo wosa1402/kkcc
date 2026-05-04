@@ -89,6 +89,17 @@
 cargo build --release
 ```
 
+### 自动发布 Release
+
+GitHub Actions 会在推送 `v*` 标签时自动构建并发布 Release：
+
+```bash
+git tag v2026.3.1
+git push origin v2026.3.1
+```
+
+也可以在 GitHub 的 Actions 页面手动运行 `Build Artifacts`，填写版本号后会创建或更新对应 Release。Release 会包含 Linux、Windows、macOS 的二进制压缩包和 `SHA256SUMS.txt`。
+
 ### 2. 最小配置
 
 创建 `config.json`：
