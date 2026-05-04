@@ -8,7 +8,7 @@ RUN pnpm build
 
 FROM rust:1.92-alpine AS builder
 
-RUN apk add --no-cache musl-dev perl make
+RUN apk add --no-cache musl-dev perl make gcc
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
@@ -19,7 +19,7 @@ RUN cargo build --release --no-default-features
 
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates sqlite
+RUN apk add --no-cache ca-certificates
 
 WORKDIR /app
 COPY --from=builder /app/target/release/kiro-rs /app/kiro-rs

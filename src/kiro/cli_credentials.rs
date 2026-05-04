@@ -1,10 +1,11 @@
 //! Local Kiro CLI credential discovery.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::kiro::model::credentials::KiroCredentials;
 
@@ -65,26 +66,34 @@ fn default_db_path(db_override: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 fn load_from_db(db_path: &Path) -> anyhow::Result<Option<KiroCredentials>> {
+    let connection = open_db(db_path)?;
+
     let has_idc_token = has_row(
-        db_path,
+        &connection,
         "SELECT 1 FROM auth_kv WHERE key IN ('kirocli:odic:token', 'kirocli:oidc:token') LIMIT 1;",
     )?;
     let has_idc_device = has_row(
-        db_path,
+        &connection,
         "SELECT 1 FROM auth_kv WHERE key IN ('kirocli:odic:device-registration', 'kirocli:oidc:device-registration') LIMIT 1;",
     )?;
     let has_social_token = has_row(
-        db_path,
+        &connection,
         "SELECT 1 FROM auth_kv WHERE key = 'kirocli:social:token' LIMIT 1;",
     )?;
 
     if has_idc_token && has_idc_device {
-        let row = query_export_row(db_path, IDC_EXPORT_QUERY)?;
+        let row = query_export_row(&connection, IDC_EXPORT_QUERY)?
+            .with_context(|| format!("no Kiro CLI IdC auth rows could be exported from {}", db_path.display()))?;
         return Ok(Some(build_credentials("idc", row)?));
     }
 
     if has_social_token {
-        let row = query_export_row(db_path, SOCIAL_EXPORT_QUERY)?;
+        let row = query_export_row(&connection, SOCIAL_EXPORT_QUERY)?.with_context(|| {
+            format!(
+                "no Kiro CLI Social auth rows could be exported from {}",
+                db_path.display()
+            )
+        })?;
         return Ok(Some(build_credentials("social", row)?));
     }
 
@@ -95,51 +104,43 @@ fn load_from_db(db_path: &Path) -> anyhow::Result<Option<KiroCredentials>> {
     Ok(None)
 }
 
-fn has_row(db_path: &Path, sql: &str) -> anyhow::Result<bool> {
-    Ok(!sqlite_value(db_path, sql)?.trim().is_empty())
+fn open_db(db_path: &Path) -> anyhow::Result<Connection> {
+    Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("failed to open Kiro CLI database: {}", db_path.display()))
 }
 
-fn query_export_row(db_path: &Path, sql: &str) -> anyhow::Result<ExportRow> {
-    let output = sqlite_value(db_path, sql)?;
-    let row = output.trim_end_matches(|c| c == '\r' || c == '\n');
-    if row.is_empty() {
-        bail!("no Kiro CLI auth rows could be exported from {}", db_path.display());
-    }
-
-    let mut fields = row.split('\t');
-    let export_row = ExportRow {
-        access_token: fields.next().unwrap_or_default().to_string(),
-        refresh_token: fields.next().unwrap_or_default().to_string(),
-        expires_raw: fields.next().unwrap_or_default().to_string(),
-        region: fields.next().unwrap_or_default().to_string(),
-        client_id: fields.next().unwrap_or_default().to_string(),
-        client_secret: fields.next().unwrap_or_default().to_string(),
-    };
-
-    Ok(export_row)
+fn has_row(connection: &Connection, sql: &str) -> anyhow::Result<bool> {
+    connection
+        .query_row(sql, [], |_| Ok(()))
+        .optional()
+        .map(|row| row.is_some())
+        .context("failed to query Kiro CLI auth rows")
 }
 
-fn sqlite_value(db_path: &Path, sql: &str) -> anyhow::Result<String> {
-    let output = Command::new("sqlite3")
-        .arg("-tabs")
-        .arg("-noheader")
-        .arg(db_path)
-        .arg(sql)
-        .output()
-        .with_context(|| {
-            "failed to run sqlite3 while auto-detecting Kiro CLI credentials; \
-             install sqlite3 or provide credentials.json explicitly"
-        })?;
+fn query_export_row(connection: &Connection, sql: &str) -> anyhow::Result<Option<ExportRow>> {
+    connection
+        .query_row(sql, [], |row| {
+            Ok(ExportRow {
+                access_token: sqlite_cell_to_string(row.get_ref(0)?),
+                refresh_token: sqlite_cell_to_string(row.get_ref(1)?),
+                expires_raw: sqlite_cell_to_string(row.get_ref(2)?),
+                region: sqlite_cell_to_string(row.get_ref(3)?),
+                client_id: sqlite_cell_to_string(row.get_ref(4)?),
+                client_secret: sqlite_cell_to_string(row.get_ref(5)?),
+            })
+        })
+        .optional()
+        .context("failed to export Kiro CLI credentials from SQLite")
+}
 
-    if !output.status.success() {
-        bail!(
-            "sqlite3 failed while reading {}: {}",
-            db_path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+fn sqlite_cell_to_string(value: ValueRef<'_>) -> String {
+    match value {
+        ValueRef::Null => String::new(),
+        ValueRef::Integer(value) => value.to_string(),
+        ValueRef::Real(value) => value.to_string(),
+        ValueRef::Text(value) => String::from_utf8_lossy(value).into_owned(),
+        ValueRef::Blob(value) => String::from_utf8_lossy(value).into_owned(),
     }
-
-    String::from_utf8(output.stdout).context("sqlite3 returned non-UTF-8 output")
 }
 
 fn build_credentials(auth_method: &str, row: ExportRow) -> anyhow::Result<KiroCredentials> {

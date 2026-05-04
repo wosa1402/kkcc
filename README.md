@@ -241,7 +241,7 @@ docker-compose up
 2. `KIRO_CLI_DB` 环境变量
 3. `~/.local/share/kiro-cli/data.sqlite3`
 
-自动识别依赖系统 `sqlite3` 命令。Docker 镜像已内置 `sqlite`，如果在容器内使用，需要把 Kiro CLI 数据库挂载进去并通过 `KIRO_CLI_DB` 或 `--kiro-cli-db` 指定路径。
+自动识别会直接读取 SQLite 数据库，不需要服务器额外安装 `sqlite3` 命令。如果在容器内使用，需要把 Kiro CLI 数据库挂载进去并通过 `KIRO_CLI_DB` 或 `--kiro-cli-db` 指定路径。
 
 也可以显式把当前本机 Kiro CLI 登录账号追加导入到 `credentials.json` 后退出：
 
