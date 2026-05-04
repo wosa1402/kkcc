@@ -8,9 +8,12 @@ mod model;
 pub mod token;
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::Parser;
+use kiro::cli_credentials;
 use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
@@ -31,6 +34,20 @@ async fn main() {
         )
         .init();
 
+    let credentials_path = args
+        .credentials
+        .clone()
+        .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+    let kiro_cli_db = args.kiro_cli_db.as_deref().map(PathBuf::from);
+
+    if args.import_kiro_cli_credentials {
+        if let Err(e) = import_kiro_cli_credentials(&credentials_path, kiro_cli_db.clone()) {
+            tracing::error!("导入 Kiro CLI 凭据失败: {:#}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // 加载配置
     let config_path = args
         .config
@@ -41,13 +58,30 @@ async fn main() {
     });
 
     // 加载凭证（支持单对象或数组格式）
-    let credentials_path = args
-        .credentials
-        .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
-    let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
+    let mut credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
         tracing::error!("加载凭证失败: {}", e);
         std::process::exit(1);
     });
+
+    if credentials_config.is_empty() {
+        match cli_credentials::detect_local_credentials_from(kiro_cli_db) {
+            Ok(Some(detected)) => {
+                tracing::info!(
+                    "凭据文件为空或不存在，已从本机 Kiro CLI 登录数据库自动生成凭据: {}",
+                    detected.db_path.display()
+                );
+                credentials_config = CredentialsConfig::Multiple(vec![detected.credentials]);
+            }
+            Ok(None) => {
+                tracing::info!(
+                    "凭据文件为空或不存在，且未检测到本机 Kiro CLI 登录数据库；如需自动检测可设置 KIRO_CLI_DB"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("自动检测本机 Kiro CLI 凭据失败: {}", e);
+            }
+        }
+    }
 
     // 判断是否为多凭据格式（用于刷新后回写）
     let is_multiple_format = credentials_config.is_multiple();
@@ -216,4 +250,71 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+fn import_kiro_cli_credentials(
+    credentials_path: &str,
+    kiro_cli_db: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let detected = cli_credentials::detect_local_credentials_from(kiro_cli_db)?
+        .context("未检测到可导入的 Kiro CLI 登录凭据；可用 --kiro-cli-db 或 KIRO_CLI_DB 指定数据库路径")?;
+
+    let mut credentials = match CredentialsConfig::load(credentials_path)
+        .with_context(|| format!("加载凭据文件失败: {}", credentials_path))?
+    {
+        CredentialsConfig::Single(credential) => vec![credential],
+        CredentialsConfig::Multiple(credentials) => credentials,
+    };
+
+    if credentials
+        .iter()
+        .any(|credential| same_credential(credential, &detected.credentials))
+    {
+        tracing::info!(
+            "当前 Kiro CLI 登录凭据已存在于 {}，跳过重复导入",
+            credentials_path
+        );
+        return Ok(());
+    }
+
+    credentials.push(detected.credentials);
+    save_credentials_list(credentials_path, &credentials)?;
+
+    tracing::info!(
+        "已从 {} 导入当前 Kiro CLI 登录凭据到 {}",
+        detected.db_path.display(),
+        credentials_path
+    );
+    Ok(())
+}
+
+fn same_credential(left: &KiroCredentials, right: &KiroCredentials) -> bool {
+    same_non_empty_value(&left.refresh_token, &right.refresh_token)
+}
+
+fn same_non_empty_value(left: &Option<String>, right: &Option<String>) -> bool {
+    match (left.as_deref(), right.as_deref()) {
+        (Some(left), Some(right)) => {
+            let left = left.trim();
+            let right = right.trim();
+            !left.is_empty() && left == right
+        }
+        _ => false,
+    }
+}
+
+fn save_credentials_list<P: AsRef<Path>>(
+    credentials_path: P,
+    credentials: &[KiroCredentials],
+) -> anyhow::Result<()> {
+    let credentials_path = credentials_path.as_ref();
+    if let Some(parent) = credentials_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建凭据目录失败: {}", parent.display()))?;
+    }
+
+    let json = serde_json::to_string_pretty(credentials).context("序列化凭据失败")?;
+    std::fs::write(credentials_path, json)
+        .with_context(|| format!("写入凭据文件失败: {}", credentials_path.display()))?;
+    Ok(())
 }

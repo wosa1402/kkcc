@@ -187,6 +187,14 @@ impl CredentialsConfig {
     pub fn is_multiple(&self) -> bool {
         matches!(self, CredentialsConfig::Multiple(_))
     }
+
+    /// 判断凭据配置是否为空。
+    pub fn is_empty(&self) -> bool {
+        match self {
+            CredentialsConfig::Single(_) => false,
+            CredentialsConfig::Multiple(creds) => creds.is_empty(),
+        }
+    }
 }
 
 impl KiroCredentials {

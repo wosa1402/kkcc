@@ -222,6 +222,32 @@ docker-compose up
 
 ### credentials.json
 
+#### 自动从 Kiro CLI 导入
+
+如果 `credentials.json` 不存在或内容为空，服务启动时会尝试从本机 Kiro CLI 的登录数据库自动生成一条凭据。默认读取顺序：
+
+1. `--kiro-cli-db <path>`
+2. `KIRO_CLI_DB` 环境变量
+3. `~/.local/share/kiro-cli/data.sqlite3`
+
+自动识别依赖系统 `sqlite3` 命令。Docker 镜像已内置 `sqlite`，如果在容器内使用，需要把 Kiro CLI 数据库挂载进去并通过 `KIRO_CLI_DB` 或 `--kiro-cli-db` 指定路径。
+
+也可以显式把当前本机 Kiro CLI 登录账号追加导入到 `credentials.json` 后退出：
+
+```bash
+./target/release/kiro-rs --import-kiro-cli-credentials --credentials ./credentials.json
+```
+
+指定数据库路径：
+
+```bash
+./target/release/kiro-rs --import-kiro-cli-credentials \
+  --credentials ./credentials.json \
+  --kiro-cli-db ~/.local/share/kiro-cli/data.sqlite3
+```
+
+该命令会把文件统一写成多凭据数组格式；如果检测到相同 `refreshToken` 已存在，会跳过重复导入。已有非空 `credentials.json` 在正常启动时优先，不会被自动覆盖。
+
 支持单对象格式（向后兼容）或数组格式（多凭据）。
 
 #### 字段说明
